@@ -8,7 +8,6 @@ import numpy as np
 class MultiViewDataInjector():
     def __init__(self, transform_list):
         self.transform_list = transform_list
-
     def __call__(self, sample):
         output = [transform(sample).unsqueeze(0) for transform in self.transform_list]
         output_cat = torch.cat(output, dim=0)

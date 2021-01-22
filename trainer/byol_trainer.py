@@ -6,8 +6,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
+import wandb
 
-from tensorboardX import SummaryWriter
+# from tensorboardX import SummaryWriter
 import apex
 from apex.parallel import DistributedDataParallel as DDP
 from apex import amp
@@ -18,13 +19,12 @@ from data import ImageNetLoader
 from utils import params_util, logging_util, eval_util
 from utils.data_prefetcher import data_prefetcher
 
+import os
 
 class BYOLTrainer():
     def __init__(self, config):
         self.config = config
-        self.time_stamp = self.config['checkpoint'].get('time_stamp',
-            datetime.datetime.now().strftime('%m%d_%H-%M'))
-
+        self.time_stamp = self.config['checkpoint'].get('time_stamp', datetime.datetime.now().strftime('%m%d_%H-%M'))
         """device parameters"""
         self.world_size = self.config['world_size']
         self.rank = self.config['rank']
@@ -62,13 +62,18 @@ class BYOLTrainer():
         self.save_epoch = self.config['checkpoint']['save_epoch']
         self.ckpt_path = self.config['checkpoint']['ckpt_path'].format(
             self.time_stamp, self.config['model']['backbone']['type'], {})
+        
+        if not os.path.exists(self.ckpt_path):
+            print("Checkpoint directory does not exist")
+            os.makedirs(self.ckpt_path)
+            print("Made the directory")
 
         """log tools in the running phase"""
         self.steps = 0
         self.log_step = self.config['log']['log_step']
         self.logging = logging_util.get_std_logging()
-        if self.rank == 0:
-            self.writer = SummaryWriter(self.config['log']['log_dir'])
+        # if self.rank == 0:
+        #     self.writer = SummaryWriter(self.config['log']['log_dir'])
 
     def construct_model(self):
         """get data loader"""
@@ -102,7 +107,6 @@ class BYOLTrainer():
         print("amp init!")
         self.model, self.optimizer = amp.initialize(
             self.model, self.optimizer, opt_level=self.opt_level)
-
         if self.distributed:
             self.model = DDP(self.model, delay_allreduce=True)
         print("amp init end!")
@@ -204,9 +208,14 @@ class BYOLTrainer():
 
             tflag = time.time()
             if self.steps % self.log_step == 0 and self.rank == 0:
-                self.writer.add_scalar('lr', round(self.optimizer.param_groups[0]['lr'], 5), self.steps)
-                self.writer.add_scalar('mm', round(self.mm, 5), self.steps)
-                self.writer.add_scalar('loss', loss_meter.val, self.steps)
+                log_dict = {
+                    'lr' : round(self.optimizer.param_groups[0]['lr'], 5),
+                    'mm' : round(self.mm, 5), 
+                    'loss' : loss_meter.val,
+                    'epoch' : epoch
+                }
+                wandb.log(log_dict, step=self.steps)
+
             log_time.update(time.time() - tflag)
 
             batch_time.update(time.time() - end)
