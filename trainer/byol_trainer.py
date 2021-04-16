@@ -13,9 +13,10 @@ import apex
 from apex.parallel import DistributedDataParallel as DDP
 from apex import amp
 
+from jacobian.jacobian import JacobianReg
 from model import BYOLModel
 from optimizer import LARS
-from data import ImageNetLoader
+from data import ImageNetLoader, STL10Loader
 from utils import params_util, logging_util, eval_util
 from utils.data_prefetcher import data_prefetcher
 
@@ -78,8 +79,14 @@ class BYOLTrainer():
     def construct_model(self):
         """get data loader"""
         self.stage = self.config['stage']
+        self.data_name = self.config['data']['name']
         assert self.stage == 'train', ValueError(f'Invalid stage: {self.stage}, only "train" for BYOL training')
-        self.data_ins = ImageNetLoader(self.config)
+        assert self.data_name in ('ImageNet', 'stl10')
+
+        if self.data_name == 'ImageNet':
+            self.data_ins = ImageNetLoader(self.config)
+        else:
+            self.data_ins = STL10Loader(self.config)
         self.train_loader = self.data_ins.get_loader(self.stage, self.train_batch_size)
 
         self.sync_bn = self.config['amp']['sync_bn']
@@ -89,9 +96,12 @@ class BYOLTrainer():
         """build model"""
         print("init byol model!")
         net = BYOLModel(self.config)
+        self.jacobian_calc = JacobianReg(1)
         if self.sync_bn:
             net = apex.parallel.convert_syncbn_model(net)
         self.model = net.to(self.device)
+        self.use_jacob_reg = self.config['jacobian']['use_jacobian']
+        self.jacob_coeff = self.config['jacobian']['jacobian_coeff']
         print("init byol model end!")
 
         """build optimizer"""
@@ -166,7 +176,8 @@ class BYOLTrainer():
         forward_time = eval_util.AverageMeter()
         backward_time = eval_util.AverageMeter()
         log_time = eval_util.AverageMeter()
-        loss_meter = eval_util.AverageMeter()
+        byol_loss_meter = eval_util.AverageMeter()
+        jacob_norm_meter = eval_util.AverageMeter()
 
         self.model.train()
 
@@ -185,16 +196,27 @@ class BYOLTrainer():
             assert images.dim() == 5, f"Input must have 5 dims, got: {images.dim()}"
             view1 = images[:, 0, ...].contiguous()
             view2 = images[:, 1, ...].contiguous()
+
+            if self.use_jacob_reg:
+                view1.requires_grad = True
+                view2.requires_grad = True
             # measure data loading time
             data_time.update(time.time() - end)
 
             # forward
             tflag = time.time()
             q, target_z = self.model(view1, view2, self.mm)
+
+            if self.use_jacob_reg:
+                views = torch.cat([view1, view2], dim=0)
+                jacob_reg = self.jacobian_calc(views, q)
+            else:
+                jacob_reg = torch.Tensor([0.0])
             forward_time.update(time.time() - tflag)
 
             tflag = time.time()
-            loss = self.forward_loss(q, target_z)
+            byol_loss = self.forward_loss(q, target_z)
+            loss = byol_loss + self.jacob_coeff*jacob_reg
 
             self.optimizer.zero_grad()
             if self.opt_level == 'O0':
@@ -204,14 +226,16 @@ class BYOLTrainer():
                     scaled_loss.backward()
             self.optimizer.step()
             backward_time.update(time.time() - tflag)
-            loss_meter.update(loss.item(), view1.size(0))
+            byol_loss_meter.update(byol_loss.item(), view1.size(0))
+            jacob_norm_meter.update(jacob_reg.item(), view1.size(0))
 
             tflag = time.time()
             if self.steps % self.log_step == 0 and self.rank == 0:
                 log_dict = {
                     'lr' : round(self.optimizer.param_groups[0]['lr'], 5),
                     'mm' : round(self.mm, 5), 
-                    'loss' : loss_meter.val,
+                    'byol_loss' : byol_loss_meter.val,
+                    'jacob_norm' : jacob_norm_meter.val,
                     'epoch' : epoch
                 }
                 wandb.log(log_dict, step=self.steps)
@@ -227,7 +251,8 @@ class BYOLTrainer():
                         f'Step {self.steps}\t'
                         f'lr {round(self.optimizer.param_groups[0]["lr"], 5)}\t'
                         f'mm {round(self.mm, 5)}\t'
-                        f'Loss {loss_meter.val:.4f} ({loss_meter.avg:.4f})\t'
+                        f'BYOL Loss {byol_loss_meter.val:.4f} ({byol_loss_meter.avg:.4f})\t'
+                        f'Jacob Norm {jacob_norm_meter.val:.4f} ({jacob_norm_meter.avg:.4f})\t'
                         f'Batch Time {batch_time.val:.4f} ({batch_time.avg:.4f})\t'
                         f'Data Time {data_time.val:.4f} ({data_time.avg:.4f})\t'
                         f'Forward Time {forward_time.val:.4f} ({forward_time.avg:.4f})\t'
