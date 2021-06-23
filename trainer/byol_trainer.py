@@ -4,14 +4,12 @@ import datetime
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
 import wandb
 
-# from tensorboardX import SummaryWriter
-import apex
-from apex.parallel import DistributedDataParallel as DDP
-from apex import amp
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 from model import BYOLModel
 from optimizer import LARS
@@ -90,7 +88,7 @@ class BYOLTrainer():
         print("init byol model!")
         net = BYOLModel(self.config)
         if self.sync_bn:
-            net = apex.parallel.convert_syncbn_model(net)
+            net = nn.SyncBatchNorm.convert_sync_batchnorm(net)
         self.model = net.to(self.device)
         print("init byol model end!")
 
@@ -105,10 +103,8 @@ class BYOLTrainer():
 
         """init amp"""
         print("amp init!")
-        self.model, self.optimizer = amp.initialize(
-            self.model, self.optimizer, opt_level=self.opt_level)
         if self.distributed:
-            self.model = DDP(self.model, delay_allreduce=True)
+            self.model = DDP(self.model, device_ids=[self.gpu])
         print("amp init end!")
 
     # resume snapshots from pre-train
@@ -124,7 +120,6 @@ class BYOLTrainer():
             self.steps = checkpoint['steps']
             self.model.load_state_dict(checkpoint['model'], strict=True)
             self.optimizer.load_state_dict(checkpoint['optimizer'])
-            amp.load_state_dict(checkpoint['amp'])
             self.logging.info(f"--> Loaded checkpoint '{model_path}' (epoch {self.start_epoch})")
 
     # save snapshots
@@ -135,7 +130,6 @@ class BYOLTrainer():
                      'steps': self.steps,
                      'model': self.model.state_dict(),
                      'optimizer': self.optimizer.state_dict(),
-                     'amp': amp.state_dict()
                     }
             torch.save(state, self.ckpt_path.format(epoch))
 
@@ -176,6 +170,7 @@ class BYOLTrainer():
         prefetcher = data_prefetcher(self.train_loader)
         images, _ = prefetcher.next()
         i = 0
+        scaler = torch.cuda.amp.GradScaler()
         while images is not None:
             i += 1
             self.adjust_learning_rate(self.steps)
@@ -188,23 +183,24 @@ class BYOLTrainer():
             # measure data loading time
             data_time.update(time.time() - end)
 
-            # forward
-            tflag = time.time()
-            q, target_z = self.model(view1, view2, self.mm)
-            forward_time.update(time.time() - tflag)
+            
+            with torch.cuda.amp.autocast():
+                # forward
+                tflag = time.time()
+                q, target_z = self.model(view1, view2, self.mm)
+                forward_time.update(time.time() - tflag)
+            
+                loss = self.forward_loss(q, target_z)
 
-            tflag = time.time()
-            loss = self.forward_loss(q, target_z)
+                # backward
+                tflag = time.time()
+                self.optimizer.zero_grad()
 
-            self.optimizer.zero_grad()
-            if self.opt_level == 'O0':
-                loss.backward()
-            else:
-                with amp.scale_loss(loss, self.optimizer) as scaled_loss:
-                    scaled_loss.backward()
-            self.optimizer.step()
-            backward_time.update(time.time() - tflag)
-            loss_meter.update(loss.item(), view1.size(0))
+                scaler.scale(loss).backward()
+                scaler.step(self.optimizer)
+                scaler.update()
+                backward_time.update(time.time() - tflag)
+                loss_meter.update(loss.item(), view1.size(0))
 
             tflag = time.time()
             if self.steps % self.log_step == 0 and self.rank == 0:
@@ -214,7 +210,7 @@ class BYOLTrainer():
                     'loss' : loss_meter.val,
                     'epoch' : epoch
                 }
-                wandb.log(log_dict, step=self.steps)
+                wandb.log(log_dict)
 
             log_time.update(time.time() - tflag)
 

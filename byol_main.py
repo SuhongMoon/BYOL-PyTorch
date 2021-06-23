@@ -11,7 +11,6 @@ from utils import logging_util
 
 def run_task(config):
     logging = logging_util.get_std_logging()
-    wandb.init(config=config, dir=config['log']['log_dir'], project="BYOL-Pytorch", reinit=True)
 
     if config['distributed']:
         world_size = int(os.environ['WORLD_SIZE'])
@@ -23,6 +22,10 @@ def run_task(config):
         logging.info(f'world_size {world_size}, gpu {local_rank}, rank {rank} init done.')
     else:
         config.update({'world_size': 1, 'rank': 0, 'local_rank': 0})
+    
+    if config['local_rank'] == 0:
+        wandb.init(config=config, dir=config['log']['log_dir'], project="BYOL-Pytorch", reinit=True)
+        
     trainer = BYOLTrainer(config)
     trainer.resume_model()
     start_epoch = trainer.start_epoch
